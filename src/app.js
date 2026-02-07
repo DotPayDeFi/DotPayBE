@@ -16,7 +16,26 @@ const CLIENT_ORIGINS = CLIENT_ORIGINS_RAW.split(",").map(normalizeOrigin).filter
 const app = express();
 
 const allowLocalhost = process.env.NODE_ENV !== "production";
-const allowedOriginSet = new Set(CLIENT_ORIGINS);
+const allowAllOrigins =
+  String(process.env.CORS_ALLOW_ALL || "").trim().toLowerCase() === "true" || CLIENT_ORIGINS.includes("*");
+
+const allowedOriginSet = new Set();
+const allowedHostSet = new Set();
+for (const entry of CLIENT_ORIGINS) {
+  if (!entry || entry === "*") continue;
+  if (entry.includes("://")) allowedOriginSet.add(entry);
+  else allowedHostSet.add(entry);
+}
+
+const allowAllByDefault =
+  process.env.NODE_ENV === "production" && allowedOriginSet.size === 0 && allowedHostSet.size === 0;
+
+const shouldAllowAll = allowAllOrigins || allowAllByDefault;
+
+if (allowAllByDefault && !global.__dotpay_cors_warned) {
+  global.__dotpay_cors_warned = true;
+  console.warn("CLIENT_ORIGINS/CLIENT_ORIGIN not set; allowing all origins (set it to lock down CORS).");
+}
 
 // Allow frontend origin(s): allowlisted in production; allow localhost in dev.
 const corsOrigin = (origin, cb) => {
@@ -27,7 +46,18 @@ const corsOrigin = (origin, cb) => {
     return cb(null, true);
   }
 
-  return cb(null, allowedOriginSet.has(o));
+  if (shouldAllowAll) return cb(null, true);
+
+  if (allowedOriginSet.has(o)) return cb(null, true);
+
+  try {
+    const { hostname } = new URL(o);
+    if (allowedHostSet.has(hostname)) return cb(null, true);
+  } catch (err) {
+    // ignore invalid Origin values
+  }
+
+  return cb(null, false);
 };
 
 app.use(
