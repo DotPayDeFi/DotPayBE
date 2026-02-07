@@ -23,7 +23,8 @@ Express.js backend for DotPay. Starting point for user storage and APIs.
    Optional:
 
    - `PORT` – server port (default `4000`)
-   - `CLIENT_ORIGIN` – allowed CORS origin (default `http://localhost:3000`)
+   - `CLIENT_ORIGINS` – allowed CORS origins (comma-separated, no trailing slash). Example: `https://dot-pay.vercel.app,http://localhost:3000`
+   - `CLIENT_ORIGIN` – legacy single-origin option (still supported)
 
 3. **Run**
 
@@ -131,7 +132,7 @@ This repo is set up to deploy on Vercel as serverless functions.
 2. In Vercel: **Add New Project** -> import the GitHub repo.
 3. Add these **Environment Variables** in Vercel (Production + Preview if you use preview deployments):
    - `MONGODB_URI` (required)
-   - `CLIENT_ORIGIN` (recommended, used for CORS in production)
+   - `CLIENT_ORIGINS` (recommended, used for CORS in production, include your frontend origin)
    - `DOTPAY_INTERNAL_API_KEY` (required for `/api/notifications/*`)
 4. Deploy.
 

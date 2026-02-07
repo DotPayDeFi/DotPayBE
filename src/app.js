@@ -6,21 +6,29 @@ const cors = require("cors");
 const usersRouter = require("./routes/users");
 const notificationsRouter = require("./routes/notifications");
 
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
+const normalizeOrigin = (value) => String(value || "").trim().replace(/\/+$/, "");
+
+// Allowlist of browser origins (comma-separated). Example:
+// CLIENT_ORIGINS=https://dot-pay.vercel.app,https://dot-pay-git-branch.vercel.app
+const CLIENT_ORIGINS_RAW = process.env.CLIENT_ORIGINS || process.env.CLIENT_ORIGIN || "";
+const CLIENT_ORIGINS = CLIENT_ORIGINS_RAW.split(",").map(normalizeOrigin).filter(Boolean);
 
 const app = express();
 
-// Allow frontend origin(s): single CLIENT_ORIGIN or any localhost in dev
-const corsOrigin =
-  process.env.NODE_ENV === "production"
-    ? CLIENT_ORIGIN
-    : (origin, cb) => {
-        if (!origin || /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
-          cb(null, true);
-        } else {
-          cb(null, false);
-        }
-      };
+const allowLocalhost = process.env.NODE_ENV !== "production";
+const allowedOriginSet = new Set(CLIENT_ORIGINS);
+
+// Allow frontend origin(s): allowlisted in production; allow localhost in dev.
+const corsOrigin = (origin, cb) => {
+  if (!origin) return cb(null, true); // non-browser clients
+
+  const o = normalizeOrigin(origin);
+  if (allowLocalhost && /^https?:\/\/localhost(:\d+)?$/.test(o)) {
+    return cb(null, true);
+  }
+
+  return cb(null, allowedOriginSet.has(o));
+};
 
 app.use(
   cors({
@@ -28,6 +36,8 @@ app.use(
     credentials: true,
   })
 );
+// Explicit preflight support for all routes.
+app.options("*", cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json());
 
 // Health endpoints.
