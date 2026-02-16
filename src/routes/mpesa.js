@@ -1,5 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
+const { ethers } = require("ethers");
 const { connectDB } = require("../config/db");
 const { mpesaConfig } = require("../config/mpesa");
 const { MpesaTransaction } = require("../models/MpesaTransaction");
@@ -14,10 +15,15 @@ const {
   queryTransactionStatus,
 } = require("../services/mpesa/darajaClient");
 const { scheduleAutoRefund } = require("../services/mpesa/refundService");
+const {
+  calculateExpectedFundingFromQuote,
+  verifyUsdcFunding,
+} = require("../services/settlement/verifyUsdcFunding");
 
 const router = express.Router();
 
 const FLOWS = ["onramp", "offramp", "paybill", "buygoods"];
+const FUNDED_FLOWS = new Set(["offramp", "paybill", "buygoods"]);
 
 function normalizeAddress(value) {
   return String(value || "").trim().toLowerCase();
@@ -39,6 +45,19 @@ function parsePositiveNumber(value, name) {
   return n;
 }
 
+function parseOptionalPositiveInt(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.trunc(n);
+}
+
+function formatFixed(value, decimals) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return Number(0).toFixed(decimals);
+  return n.toFixed(decimals);
+}
+
 function isValidPhone(phone) {
   return /^254\d{9}$/.test(phone);
 }
@@ -52,6 +71,10 @@ function requireMpesaEnabled(req, res) {
     return false;
   }
   return true;
+}
+
+function requiresOnchainFunding(flowType) {
+  return Boolean(mpesaConfig.settlement?.requireOnchainFunding) && FUNDED_FLOWS.has(flowType);
 }
 
 function mapTransaction(tx) {
@@ -106,6 +129,7 @@ function requireInternalKey(req, res, next) {
 function ensureSensitiveAuth(body) {
   const pin = String(body?.pin || "").trim();
   const signature = String(body?.signature || "").trim();
+  const nonce = String(body?.nonce || "").trim();
   if (!pin || pin.length < mpesaConfig.security.pinMinLength) {
     throw new Error(`pin is required and must be at least ${mpesaConfig.security.pinMinLength} digits.`);
   }
@@ -115,7 +139,11 @@ function ensureSensitiveAuth(body) {
   if (!signature || signature.length < 24) {
     throw new Error("signature is required.");
   }
+  if (!nonce || nonce.length < 8) {
+    throw new Error("nonce is required and must be at least 8 characters.");
+  }
   const signedAt = body?.signedAt ? new Date(body.signedAt) : new Date();
+  const signedAtRaw = String(body?.signedAt || signedAt.toISOString()).trim();
   if (Number.isNaN(signedAt.getTime())) {
     throw new Error("signedAt must be a valid ISO date.");
   }
@@ -132,8 +160,91 @@ function ensureSensitiveAuth(body) {
     pin,
     signature,
     signedAt,
-    nonce: String(body?.nonce || "").trim() || null,
+    signedAtRaw,
+    nonce,
   };
+}
+
+function targetDescriptor(tx) {
+  if (tx.flowType === "offramp") return `phone:${tx.targets?.phoneNumber || "-"}`;
+  if (tx.flowType === "paybill") {
+    return `paybill:${tx.targets?.paybillNumber || "-"}:${tx.targets?.accountReference || "-"}`;
+  }
+  if (tx.flowType === "buygoods") {
+    return `buygoods:${tx.targets?.tillNumber || "-"}:${tx.targets?.accountReference || "DotPay"}`;
+  }
+  return "onramp";
+}
+
+function buildAuthorizationMessage({ tx, signedAtRaw, nonce }) {
+  return [
+    "DotPay Authorization",
+    `Transaction: ${tx.transactionId}`,
+    `Flow: ${tx.flowType}`,
+    `Quote: ${tx.quote?.quoteId || "-"}`,
+    `AmountKES: ${formatFixed(tx.quote?.totalDebitKes || tx.quote?.amountKes || 0, 2)}`,
+    `AmountUSDC: ${formatFixed(tx.onchain?.expectedAmountUsd || tx.quote?.amountUsd || 0, 6)}`,
+    `Target: ${targetDescriptor(tx)}`,
+    `Nonce: ${nonce}`,
+    `SignedAt: ${signedAtRaw}`,
+  ].join("\n");
+}
+
+function verifyAuthorizationSignature({ tx, userAddress, signature, signedAtRaw, nonce }) {
+  const message = buildAuthorizationMessage({ tx, signedAtRaw, nonce });
+  let recovered = "";
+
+  try {
+    recovered = String(ethers.verifyMessage(message, signature) || "").trim().toLowerCase();
+  } catch {
+    throw new Error("Invalid signature.");
+  }
+
+  if (!recovered || recovered !== userAddress) {
+    throw new Error("Signature does not match the authenticated wallet.");
+  }
+
+  return message;
+}
+
+function applyFundingDefaults(tx) {
+  const required = requiresOnchainFunding(tx.flowType);
+  const treasuryAddress = String(mpesaConfig.treasury?.address || "").trim().toLowerCase();
+  const tokenAddress = String(mpesaConfig.treasury?.usdcContract || "").trim().toLowerCase();
+  const chainId = parseOptionalPositiveInt(mpesaConfig.treasury?.chainId);
+
+  tx.onchain = tx.onchain || {};
+  tx.onchain.required = required;
+  tx.onchain.tokenSymbol = "USDC";
+  tx.onchain.tokenAddress = tokenAddress || tx.onchain.tokenAddress || null;
+  tx.onchain.treasuryAddress = treasuryAddress || tx.onchain.treasuryAddress || null;
+  tx.onchain.chainId = chainId || tx.onchain.chainId || null;
+
+  if (!required) {
+    tx.onchain.verificationStatus = "not_required";
+    tx.onchain.expectedAmountUsd = 0;
+    tx.onchain.expectedAmountUnits = null;
+    return;
+  }
+
+  if (!tokenAddress || !treasuryAddress) {
+    throw new Error(
+      "Treasury settlement is not configured. Set TREASURY_USDC_CONTRACT and TREASURY_PLATFORM_ADDRESS (or TREASURY_PRIVATE_KEY)."
+    );
+  }
+  if (!String(mpesaConfig.treasury?.rpcUrl || "").trim()) {
+    throw new Error("TREASURY_RPC_URL is required when on-chain funding is enabled.");
+  }
+
+  const { expectedUnitsString, expectedUsd } = calculateExpectedFundingFromQuote(
+    tx.quote,
+    mpesaConfig.treasury?.usdcDecimals
+  );
+
+  tx.onchain.verificationStatus =
+    tx.onchain.verificationStatus === "verified" ? "verified" : "pending";
+  tx.onchain.expectedAmountUsd = expectedUsd;
+  tx.onchain.expectedAmountUnits = expectedUnitsString;
 }
 
 async function enforceLimits(userAddress, amountKes) {
@@ -189,6 +300,11 @@ async function fetchOrCreateQuoteTransaction({
     if (isQuoteExpired(tx.quote)) {
       throw new Error("Quote has expired. Please generate a new quote.");
     }
+
+    if (FUNDED_FLOWS.has(flowType) && !tx.onchain?.expectedAmountUnits) {
+      applyFundingDefaults(tx);
+      await tx.save();
+    }
   }
 
   if (!tx) {
@@ -215,6 +331,9 @@ async function fetchOrCreateQuoteTransaction({
         },
       },
     });
+
+    applyFundingDefaults(tx);
+    await tx.save();
   }
 
   return tx;
@@ -235,6 +354,75 @@ function buildCallbackUrl(kind, tx) {
     return `${mpesaConfig.callbacks.resultBaseUrl}/api/mpesa/webhooks/b2b/result?tx=${txId}`;
   }
   return `${mpesaConfig.callbacks.timeoutBaseUrl}/api/mpesa/webhooks/b2b/timeout?tx=${txId}`;
+}
+
+async function ensureFundingVerified({ tx, userAddress, body }) {
+  if (!tx.onchain?.required) {
+    tx.onchain = tx.onchain || {};
+    tx.onchain.verificationStatus = "not_required";
+    return;
+  }
+
+  const onchainTxHash = String(body?.onchainTxHash || tx.onchain?.txHash || "")
+    .trim()
+    .toLowerCase();
+  if (!onchainTxHash) {
+    throw new Error("onchainTxHash is required before M-Pesa submission.");
+  }
+
+  const duplicate = await MpesaTransaction.findOne({
+    _id: { $ne: tx._id },
+    "onchain.txHash": onchainTxHash,
+  }).select({ transactionId: 1 });
+  if (duplicate) {
+    throw new Error("This on-chain funding transaction is already linked to another payout.");
+  }
+
+  const expectedUnits = BigInt(String(tx.onchain?.expectedAmountUnits || "0"));
+  if (expectedUnits <= 0n) {
+    throw new Error("Funding requirement is missing for this transaction.");
+  }
+
+  if (tx.status === "awaiting_user_authorization") {
+    assertTransition(tx, "awaiting_onchain_funding", "Awaiting on-chain funding", "api");
+  }
+
+  try {
+    const verified = await verifyUsdcFunding({
+      txHash: onchainTxHash,
+      expectedFromAddress: userAddress,
+      providedChainId: body?.chainId,
+      expectedMinAmountUnits: expectedUnits,
+    });
+
+    tx.onchain = {
+      ...(tx.onchain || {}),
+      txHash: verified.txHash,
+      chainId: verified.chainId,
+      tokenAddress: verified.tokenAddress,
+      treasuryAddress: verified.treasuryAddress,
+      verificationStatus: "verified",
+      verificationError: null,
+      fundedAmountUnits: verified.fundedAmountUnits,
+      fundedAmountUsd: verified.fundedAmountUsd,
+      fromAddress: verified.fromAddress,
+      toAddress: verified.toAddress,
+      logIndex: Number.isFinite(verified.logIndex) ? verified.logIndex : null,
+      verifiedBy: "api",
+      verifiedAt: new Date(),
+    };
+  } catch (err) {
+    tx.onchain = {
+      ...(tx.onchain || {}),
+      txHash: onchainTxHash,
+      verificationStatus: "failed",
+      verificationError: err.message,
+      verifiedBy: "api",
+      verifiedAt: new Date(),
+    };
+    await tx.save();
+    throw err;
+  }
 }
 
 router.use(async (req, res, next) => {
@@ -297,7 +485,8 @@ router.post("/internal/reconcile", requireInternalKey, async (req, res) => {
         }
       }
 
-      if (tx.status === "mpesa_processing" && tx.updatedAt <= cutoff) {
+      const shouldForceById = Boolean(transactionId);
+      if (tx.status === "mpesa_processing" && (shouldForceById || tx.updatedAt <= cutoff)) {
         assertTransition(tx, "failed", "Reconcile timeout", "reconcile");
         summary.markedFailed += 1;
         changed = true;
@@ -364,6 +553,9 @@ router.post("/quotes", async (req, res) => {
         userAgent: req.get("user-agent") || null,
       },
     });
+
+    applyFundingDefaults(tx);
+    await tx.save();
 
     return res.status(200).json({
       success: true,
@@ -477,23 +669,28 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
     tx.idempotencyKey = idempotencyKey;
     tx.businessId = req.body?.businessId ? String(req.body.businessId).trim() : tx.businessId;
     tx.targets = { ...tx.targets, phoneNumber };
+    applyFundingDefaults(tx);
     tx.authorization = {
       pinProvided: true,
       signature: auth.signature,
       signedAt: auth.signedAt,
       nonce: auth.nonce,
     };
-
-    const onchainTxHash = String(req.body?.onchainTxHash || "").trim().toLowerCase();
-    if (onchainTxHash) {
-      tx.onchain = {
-        txHash: onchainTxHash,
-        chainId: req.body?.chainId ? Number(req.body.chainId) : null,
-        verifiedAt: new Date(),
-      };
-    }
+    const signatureMessage = verifyAuthorizationSignature({
+      tx,
+      userAddress,
+      signature: auth.signature,
+      signedAtRaw: auth.signedAtRaw,
+      nonce: auth.nonce,
+    });
+    tx.metadata = tx.metadata || {};
+    tx.metadata.extra = {
+      ...(tx.metadata.extra || {}),
+      authorizationMessage: signatureMessage,
+    };
 
     assertTransition(tx, "awaiting_user_authorization", "User authorization captured", "api");
+    await ensureFundingVerified({ tx, userAddress, body: req.body });
     assertTransition(tx, "mpesa_submitted", "Submitting B2C payout", "api");
 
     const resultUrl = buildCallbackUrl("b2c_result", tx);
@@ -507,8 +704,7 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
       occasion: "DotPay cashout",
       resultUrl,
       timeoutUrl,
-      // Prefer BusinessPayment as a sensible default; sandbox docs also accept SalaryPayment.
-      commandId: "BusinessPayment",
+      commandId: mpesaConfig.commands?.b2cOfframp || "BusinessPayment",
     });
 
     tx.daraja = {
@@ -576,14 +772,28 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
     tx.idempotencyKey = idempotencyKey;
     tx.businessId = req.body?.businessId ? String(req.body.businessId).trim() : tx.businessId;
     tx.targets = { ...tx.targets, paybillNumber, accountReference };
+    applyFundingDefaults(tx);
     tx.authorization = {
       pinProvided: true,
       signature: auth.signature,
       signedAt: auth.signedAt,
       nonce: auth.nonce,
     };
+    const signatureMessage = verifyAuthorizationSignature({
+      tx,
+      userAddress,
+      signature: auth.signature,
+      signedAtRaw: auth.signedAtRaw,
+      nonce: auth.nonce,
+    });
+    tx.metadata = tx.metadata || {};
+    tx.metadata.extra = {
+      ...(tx.metadata.extra || {}),
+      authorizationMessage: signatureMessage,
+    };
 
     assertTransition(tx, "awaiting_user_authorization", "User authorization captured", "api");
+    await ensureFundingVerified({ tx, userAddress, body: req.body });
     assertTransition(tx, "mpesa_submitted", "Submitting B2B paybill", "api");
 
     const resultUrl = buildCallbackUrl("b2b_result", tx);
@@ -595,9 +805,19 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
       originatorConversationId: tx.transactionId,
       resultUrl,
       timeoutUrl,
-      commandId: "BusinessPayBill",
+      commandId: mpesaConfig.commands?.b2bPaybill || "BusinessPayBill",
       remarks: "DotPay merchant paybill",
       receiverIdentifierType: "4",
+      requester:
+        String(req.body?.requester || "").trim() ||
+        mpesaConfig.credentials?.b2bRequester ||
+        "",
+      initiatorNameOverride:
+        mpesaConfig.credentials?.b2bPaybillInitiatorName ||
+        "",
+      securityCredentialOverride:
+        mpesaConfig.credentials?.b2bPaybillSecurityCredential ||
+        "",
     });
 
     tx.daraja = {
@@ -661,14 +881,28 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
     tx.idempotencyKey = idempotencyKey;
     tx.businessId = req.body?.businessId ? String(req.body.businessId).trim() : tx.businessId;
     tx.targets = { ...tx.targets, tillNumber };
+    applyFundingDefaults(tx);
     tx.authorization = {
       pinProvided: true,
       signature: auth.signature,
       signedAt: auth.signedAt,
       nonce: auth.nonce,
     };
+    const signatureMessage = verifyAuthorizationSignature({
+      tx,
+      userAddress,
+      signature: auth.signature,
+      signedAtRaw: auth.signedAtRaw,
+      nonce: auth.nonce,
+    });
+    tx.metadata = tx.metadata || {};
+    tx.metadata.extra = {
+      ...(tx.metadata.extra || {}),
+      authorizationMessage: signatureMessage,
+    };
 
     assertTransition(tx, "awaiting_user_authorization", "User authorization captured", "api");
+    await ensureFundingVerified({ tx, userAddress, body: req.body });
     assertTransition(tx, "mpesa_submitted", "Submitting B2B buygoods", "api");
 
     const resultUrl = buildCallbackUrl("b2b_result", tx);
@@ -681,10 +915,20 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
       originatorConversationId: tx.transactionId,
       resultUrl,
       timeoutUrl,
-      commandId: "BusinessBuyGoods",
+      commandId: mpesaConfig.commands?.b2bBuygoods || "BusinessBuyGoods",
       remarks: "DotPay buy goods",
-      // Till numbers use identifier type 2 in B2B.
-      receiverIdentifierType: "2",
+      receiverIdentifierType:
+        mpesaConfig.commands?.b2bBuygoodsReceiverIdentifierType || "2",
+      requester:
+        String(req.body?.requester || "").trim() ||
+        mpesaConfig.credentials?.b2bRequester ||
+        "",
+      initiatorNameOverride:
+        mpesaConfig.credentials?.b2bBuygoodsInitiatorName ||
+        "",
+      securityCredentialOverride:
+        mpesaConfig.credentials?.b2bBuygoodsSecurityCredential ||
+        "",
     });
 
     tx.daraja = {

@@ -3,6 +3,7 @@ const DEFAULT_PRODUCTION_BASE_URL = "https://api.safaricom.co.ke";
 
 const fs = require("fs");
 const path = require("path");
+const { ethers } = require("ethers");
 const { generateSecurityCredentialFromCertPath } = require("../services/mpesa/securityCredential");
 
 function toBool(value, fallback = false) {
@@ -51,6 +52,21 @@ if (!securityCredential) {
   }
 }
 
+function deriveTreasuryAddressFromPrivateKey(privateKey) {
+  const pk = String(privateKey || "").trim();
+  if (!pk) return "";
+  try {
+    return new ethers.Wallet(pk).address;
+  } catch {
+    return "";
+  }
+}
+
+const treasuryPrivateKey = String(process.env.TREASURY_PRIVATE_KEY || "").trim();
+const treasuryAddress =
+  String(process.env.TREASURY_PLATFORM_ADDRESS || "").trim() ||
+  deriveTreasuryAddressFromPrivateKey(treasuryPrivateKey);
+
 const mpesaConfig = {
   enabled: toBool(process.env.MPESA_ENABLED, false),
   env,
@@ -84,6 +100,49 @@ const mpesaConfig = {
     passkey: String(process.env.MPESA_PASSKEY || "").trim(),
     initiatorName: String(process.env.MPESA_INITIATOR_NAME || "").trim(),
     securityCredential,
+
+    // Optional per-product overrides (some Daraja apps issue different initiators/credentials per API product).
+    b2cInitiatorName:
+      String(process.env.MPESA_B2C_INITIATOR_NAME || "").trim() ||
+      String(process.env.MPESA_INITIATOR_NAME || "").trim(),
+    b2cSecurityCredential:
+      String(process.env.MPESA_B2C_SECURITY_CREDENTIAL || "").trim() ||
+      securityCredential,
+    b2bInitiatorName:
+      String(process.env.MPESA_B2B_INITIATOR_NAME || "").trim() ||
+      String(process.env.MPESA_INITIATOR_NAME || "").trim(),
+    b2bSecurityCredential:
+      String(process.env.MPESA_B2B_SECURITY_CREDENTIAL || "").trim() ||
+      securityCredential,
+
+    // Optional per-flow B2B overrides.
+    b2bPaybillInitiatorName:
+      String(process.env.MPESA_B2B_PAYBILL_INITIATOR_NAME || "").trim() ||
+      String(process.env.MPESA_B2B_INITIATOR_NAME || "").trim() ||
+      String(process.env.MPESA_INITIATOR_NAME || "").trim(),
+    b2bPaybillSecurityCredential:
+      String(process.env.MPESA_B2B_PAYBILL_SECURITY_CREDENTIAL || "").trim() ||
+      String(process.env.MPESA_B2B_SECURITY_CREDENTIAL || "").trim() ||
+      securityCredential,
+    b2bBuygoodsInitiatorName:
+      String(process.env.MPESA_B2B_BUYGOODS_INITIATOR_NAME || "").trim() ||
+      String(process.env.MPESA_B2B_INITIATOR_NAME || "").trim() ||
+      String(process.env.MPESA_INITIATOR_NAME || "").trim(),
+    b2bBuygoodsSecurityCredential:
+      String(process.env.MPESA_B2B_BUYGOODS_SECURITY_CREDENTIAL || "").trim() ||
+      String(process.env.MPESA_B2B_SECURITY_CREDENTIAL || "").trim() ||
+      securityCredential,
+
+    // Optional Requester for B2B payloads (commonly used in sandbox samples).
+    b2bRequester: String(process.env.MPESA_B2B_REQUESTER || "").trim(),
+  },
+  commands: {
+    b2cOfframp: String(process.env.MPESA_B2C_COMMAND_ID || "BusinessPayment").trim(),
+    b2bPaybill: String(process.env.MPESA_B2B_PAYBILL_COMMAND_ID || "BusinessPayBill").trim(),
+    b2bBuygoods: String(process.env.MPESA_B2B_BUYGOODS_COMMAND_ID || "BusinessBuyGoods").trim(),
+    b2bBuygoodsReceiverIdentifierType: String(
+      process.env.MPESA_B2B_BUYGOODS_RECEIVER_IDENTIFIER_TYPE || "2"
+    ).trim(),
   },
   callbacks: {
     resultBaseUrl,
@@ -107,11 +166,16 @@ const mpesaConfig = {
   treasury: {
     refundEnabled: toBool(process.env.TREASURY_REFUND_ENABLED, true),
     rpcUrl: normalizeUrl(process.env.TREASURY_RPC_URL),
-    privateKey: String(process.env.TREASURY_PRIVATE_KEY || "").trim(),
+    privateKey: treasuryPrivateKey,
+    address: treasuryAddress ? treasuryAddress.toLowerCase() : "",
     usdcContract: String(process.env.TREASURY_USDC_CONTRACT || "").trim(),
     chainId: toNumber(process.env.TREASURY_CHAIN_ID, 0) || null,
     usdcDecimals: toNumber(process.env.TREASURY_USDC_DECIMALS, 6),
     waitConfirmations: Math.max(1, toNumber(process.env.TREASURY_WAIT_CONFIRMATIONS, 1)),
+  },
+  settlement: {
+    requireOnchainFunding: toBool(process.env.MPESA_REQUIRE_ONCHAIN_FUNDING, true),
+    minFundingConfirmations: Math.max(1, toNumber(process.env.MPESA_MIN_FUNDING_CONFIRMATIONS, 1)),
   },
 };
 
@@ -124,6 +188,13 @@ function ensureMpesaConfigured() {
   if (!mpesaConfig.credentials.b2bShortcode) missing.push("MPESA_B2B_SHORTCODE or MPESA_SHORTCODE");
   if (!mpesaConfig.callbacks.resultBaseUrl) missing.push("MPESA_RESULT_BASE_URL");
   if (!mpesaConfig.callbacks.timeoutBaseUrl) missing.push("MPESA_TIMEOUT_BASE_URL");
+  if (mpesaConfig.settlement?.requireOnchainFunding) {
+    if (!mpesaConfig.treasury?.rpcUrl) missing.push("TREASURY_RPC_URL");
+    if (!mpesaConfig.treasury?.usdcContract) missing.push("TREASURY_USDC_CONTRACT");
+    if (!mpesaConfig.treasury?.address) {
+      missing.push("TREASURY_PLATFORM_ADDRESS (or TREASURY_PRIVATE_KEY)");
+    }
+  }
 
   if (missing.length > 0) {
     throw new Error(`Missing M-Pesa configuration: ${missing.join(", ")}`);

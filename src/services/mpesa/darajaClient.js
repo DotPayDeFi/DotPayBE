@@ -86,14 +86,16 @@ async function initiateB2C({
 }) {
   const shortcode = mpesaConfig.credentials.b2cShortcode || mpesaConfig.credentials.shortcode;
   if (!shortcode) throw new Error("Missing M-Pesa B2C shortcode (MPESA_B2C_SHORTCODE).");
-  if (!mpesaConfig.credentials.initiatorName) throw new Error("Missing M-Pesa initiator name (MPESA_INITIATOR_NAME).");
-  if (!mpesaConfig.credentials.securityCredential) {
+  const initiatorName = mpesaConfig.credentials.b2cInitiatorName || mpesaConfig.credentials.initiatorName;
+  const securityCredential = mpesaConfig.credentials.b2cSecurityCredential || mpesaConfig.credentials.securityCredential;
+  if (!initiatorName) throw new Error("Missing M-Pesa initiator name (MPESA_B2C_INITIATOR_NAME or MPESA_INITIATOR_NAME).");
+  if (!securityCredential) {
     throw new Error("Missing M-Pesa security credential (MPESA_SECURITY_CREDENTIAL or MPESA_INITIATOR_PASSWORD + MPESA_CERT_PATH).");
   }
   const payload = {
     OriginatorConversationID: originatorConversationId,
-    InitiatorName: mpesaConfig.credentials.initiatorName,
-    SecurityCredential: mpesaConfig.credentials.securityCredential,
+    InitiatorName: initiatorName,
+    SecurityCredential: securityCredential,
     CommandID: commandId,
     Amount: Math.max(1, Math.round(Number(amountKes))),
     PartyA: shortcode,
@@ -118,17 +120,28 @@ async function initiateB2B({
   remarks,
   senderIdentifierType = "4",
   receiverIdentifierType = "4",
+  requester = "",
+  initiatorNameOverride = "",
+  securityCredentialOverride = "",
 }) {
   const shortcode = mpesaConfig.credentials.b2bShortcode || mpesaConfig.credentials.shortcode;
   if (!shortcode) throw new Error("Missing M-Pesa B2B shortcode (MPESA_B2B_SHORTCODE).");
-  if (!mpesaConfig.credentials.initiatorName) throw new Error("Missing M-Pesa initiator name (MPESA_INITIATOR_NAME).");
-  if (!mpesaConfig.credentials.securityCredential) {
+  const initiatorName =
+    String(initiatorNameOverride || "").trim() ||
+    mpesaConfig.credentials.b2bInitiatorName ||
+    mpesaConfig.credentials.initiatorName;
+  const securityCredential =
+    String(securityCredentialOverride || "").trim() ||
+    mpesaConfig.credentials.b2bSecurityCredential ||
+    mpesaConfig.credentials.securityCredential;
+  if (!initiatorName) throw new Error("Missing M-Pesa initiator name (MPESA_B2B_INITIATOR_NAME or MPESA_INITIATOR_NAME).");
+  if (!securityCredential) {
     throw new Error("Missing M-Pesa security credential (MPESA_SECURITY_CREDENTIAL or MPESA_INITIATOR_PASSWORD + MPESA_CERT_PATH).");
   }
   const payload = {
     OriginatorConversationID: originatorConversationId,
-    Initiator: mpesaConfig.credentials.initiatorName,
-    SecurityCredential: mpesaConfig.credentials.securityCredential,
+    Initiator: initiatorName,
+    SecurityCredential: securityCredential,
     CommandID: commandId,
     SenderIdentifierType: String(senderIdentifierType),
     RecieverIdentifierType: String(receiverIdentifierType),
@@ -141,14 +154,21 @@ async function initiateB2B({
     ResultURL: resultUrl,
   };
 
+  const requesterValue = String(requester || "").trim();
+  if (requesterValue) {
+    payload.Requester = requesterValue;
+  }
+
   return darajaRequest(mpesaConfig.endpoints.b2bPayment, payload);
 }
 
 async function queryTransactionStatus({ transactionReceipt, originatorConversationId }) {
   const shortcode = mpesaConfig.credentials.b2cShortcode || mpesaConfig.credentials.shortcode;
+  const initiatorName = mpesaConfig.credentials.b2cInitiatorName || mpesaConfig.credentials.initiatorName;
+  const securityCredential = mpesaConfig.credentials.b2cSecurityCredential || mpesaConfig.credentials.securityCredential;
   const payload = {
-    Initiator: mpesaConfig.credentials.initiatorName,
-    SecurityCredential: mpesaConfig.credentials.securityCredential,
+    Initiator: initiatorName,
+    SecurityCredential: securityCredential,
     CommandID: "TransactionStatusQuery",
     TransactionID: transactionReceipt,
     OriginalConversationID: originatorConversationId,

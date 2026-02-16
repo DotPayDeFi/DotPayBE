@@ -15,6 +15,12 @@ function pseudoRefundReference() {
 }
 
 function getRefundAmountUsd(transaction) {
+  const funded = Number(transaction?.onchain?.fundedAmountUsd || 0);
+  if (Number.isFinite(funded) && funded > 0) return funded;
+
+  const expected = Number(transaction?.onchain?.expectedAmountUsd || 0);
+  if (Number.isFinite(expected) && expected > 0) return expected;
+
   const amount = Number(transaction?.quote?.amountUsd || 0);
   return Number.isFinite(amount) ? Math.max(0, amount) : 0;
 }

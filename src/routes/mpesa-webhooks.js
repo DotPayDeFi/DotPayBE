@@ -16,6 +16,20 @@ function callbackAck(res) {
   return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
 }
 
+function parseResultCode(value) {
+  const raw =
+    value === undefined || value === null
+      ? null
+      : String(value).trim() || null;
+  const asNumber = raw === null ? NaN : Number(raw);
+  return {
+    raw,
+    number: Number.isFinite(asNumber) ? asNumber : null,
+    key: raw ?? "unknown",
+    isSuccess: raw === "0" || asNumber === 0,
+  };
+}
+
 async function saveEventIfNew({ eventKey, transactionId, eventType, payload }) {
   try {
     await MpesaEvent.create({
@@ -95,13 +109,13 @@ router.post("/webhooks/stk", async (req, res) => {
     const stk = req.body?.Body?.stkCallback || {};
     const checkoutRequestId = stk?.CheckoutRequestID;
     const merchantRequestId = stk?.MerchantRequestID;
-    const resultCode = Number(stk?.ResultCode);
+    const parsedCode = parseResultCode(stk?.ResultCode);
     const resultDesc = String(stk?.ResultDesc || "").trim() || null;
 
     const tx = await findTransactionFromWebhook(req, { checkoutRequestId, merchantRequestId });
     if (!tx) return callbackAck(res);
 
-    const eventKey = `stk:${tx.transactionId}:${checkoutRequestId || "none"}:${resultCode}`;
+    const eventKey = `stk:${tx.transactionId}:${checkoutRequestId || "none"}:${parsedCode.key}`;
     const inserted = await saveEventIfNew({
       eventKey,
       transactionId: tx.transactionId,
@@ -119,14 +133,15 @@ router.post("/webhooks/stk", async (req, res) => {
       ...(tx.daraja || {}),
       merchantRequestId: merchantRequestId || tx.daraja?.merchantRequestId || null,
       checkoutRequestId: checkoutRequestId || tx.daraja?.checkoutRequestId || null,
-      resultCode: Number.isFinite(resultCode) ? resultCode : null,
+      resultCode: parsedCode.number,
+      resultCodeRaw: parsedCode.raw,
       resultDesc,
       receiptNumber: receiptNumber || tx.daraja?.receiptNumber || null,
       rawCallback: req.body,
       callbackReceivedAt: new Date(),
     };
 
-    if (resultCode === 0) {
+    if (parsedCode.isSuccess) {
       if (tx.status !== "succeeded") {
         assertTransition(tx, "succeeded", "STK callback success", "webhook");
       }
@@ -152,13 +167,13 @@ router.post("/webhooks/b2c/result", async (req, res) => {
     const result = req.body?.Result || {};
     const conversationId = result?.ConversationID;
     const originatorConversationId = result?.OriginatorConversationID;
-    const resultCode = Number(result?.ResultCode);
+    const parsedCode = parseResultCode(result?.ResultCode);
     const resultDesc = String(result?.ResultDesc || "").trim() || null;
 
     const tx = await findTransactionFromWebhook(req, { conversationId, originatorConversationId });
     if (!tx) return callbackAck(res);
 
-    const eventKey = `b2c_result:${tx.transactionId}:${conversationId || "none"}:${resultCode}`;
+    const eventKey = `b2c_result:${tx.transactionId}:${conversationId || "none"}:${parsedCode.key}`;
     const inserted = await saveEventIfNew({
       eventKey,
       transactionId: tx.transactionId,
@@ -173,14 +188,15 @@ router.post("/webhooks/b2c/result", async (req, res) => {
       ...(tx.daraja || {}),
       conversationId: conversationId || tx.daraja?.conversationId || null,
       originatorConversationId: originatorConversationId || tx.daraja?.originatorConversationId || null,
-      resultCode: Number.isFinite(resultCode) ? resultCode : null,
+      resultCode: parsedCode.number,
+      resultCodeRaw: parsedCode.raw,
       resultDesc,
       receiptNumber: receipt || tx.daraja?.receiptNumber || null,
       rawCallback: req.body,
       callbackReceivedAt: new Date(),
     };
 
-    if (resultCode === 0) {
+    if (parsedCode.isSuccess) {
       if (tx.status !== "succeeded") {
         assertTransition(tx, "succeeded", "B2C callback success", "webhook");
       }
@@ -248,13 +264,13 @@ router.post("/webhooks/b2b/result", async (req, res) => {
     const result = req.body?.Result || {};
     const conversationId = result?.ConversationID;
     const originatorConversationId = result?.OriginatorConversationID;
-    const resultCode = Number(result?.ResultCode);
+    const parsedCode = parseResultCode(result?.ResultCode);
     const resultDesc = String(result?.ResultDesc || "").trim() || null;
 
     const tx = await findTransactionFromWebhook(req, { conversationId, originatorConversationId });
     if (!tx) return callbackAck(res);
 
-    const eventKey = `b2b_result:${tx.transactionId}:${conversationId || "none"}:${resultCode}`;
+    const eventKey = `b2b_result:${tx.transactionId}:${conversationId || "none"}:${parsedCode.key}`;
     const inserted = await saveEventIfNew({
       eventKey,
       transactionId: tx.transactionId,
@@ -267,13 +283,14 @@ router.post("/webhooks/b2b/result", async (req, res) => {
       ...(tx.daraja || {}),
       conversationId: conversationId || tx.daraja?.conversationId || null,
       originatorConversationId: originatorConversationId || tx.daraja?.originatorConversationId || null,
-      resultCode: Number.isFinite(resultCode) ? resultCode : null,
+      resultCode: parsedCode.number,
+      resultCodeRaw: parsedCode.raw,
       resultDesc,
       rawCallback: req.body,
       callbackReceivedAt: new Date(),
     };
 
-    if (resultCode === 0) {
+    if (parsedCode.isSuccess) {
       if (tx.status !== "succeeded") {
         assertTransition(tx, "succeeded", "B2B callback success", "webhook");
       }

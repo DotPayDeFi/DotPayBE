@@ -2,6 +2,18 @@ const crypto = require("crypto");
 const fs = require("fs");
 
 function normalizePem(input) {
+  if (Buffer.isBuffer(input)) {
+    const utf8 = input.toString("utf8").trim();
+    if (utf8.includes("BEGIN CERTIFICATE") || utf8.includes("BEGIN PUBLIC KEY")) {
+      return utf8;
+    }
+
+    // Treat raw bytes as DER-encoded cert and wrap as PEM.
+    const b64 = input.toString("base64");
+    const lines = b64.match(/.{1,64}/g) || [];
+    return `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----`;
+  }
+
   const text = String(input || "").trim();
   if (!text) return "";
   if (text.includes("BEGIN CERTIFICATE") || text.includes("BEGIN PUBLIC KEY")) return text;
@@ -45,8 +57,8 @@ function generateSecurityCredential({ initiatorPassword, certificatePemOrDer }) 
 }
 
 function generateSecurityCredentialFromCertPath({ initiatorPassword, certPath }) {
-  const pem = fs.readFileSync(certPath, "utf8");
-  return generateSecurityCredential({ initiatorPassword, certificatePemOrDer: pem });
+  const certRaw = fs.readFileSync(certPath);
+  return generateSecurityCredential({ initiatorPassword, certificatePemOrDer: certRaw });
 }
 
 module.exports = {

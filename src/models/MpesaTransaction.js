@@ -91,6 +91,24 @@ const mpesaTransactionSchema = new mongoose.Schema(
     onchain: {
       txHash: { type: String, default: null, trim: true, lowercase: true },
       chainId: { type: Number, default: null },
+      required: { type: Boolean, default: false },
+      verificationStatus: {
+        type: String,
+        enum: ["not_required", "pending", "verified", "failed"],
+        default: "not_required",
+      },
+      tokenAddress: { type: String, default: null, trim: true, lowercase: true },
+      tokenSymbol: { type: String, default: "USDC", trim: true },
+      treasuryAddress: { type: String, default: null, trim: true, lowercase: true },
+      expectedAmountUsd: { type: Number, min: 0, default: 0 },
+      expectedAmountUnits: { type: String, default: null, trim: true },
+      fundedAmountUsd: { type: Number, min: 0, default: 0 },
+      fundedAmountUnits: { type: String, default: null, trim: true },
+      fromAddress: { type: String, default: null, trim: true, lowercase: true },
+      toAddress: { type: String, default: null, trim: true, lowercase: true },
+      logIndex: { type: Number, default: null },
+      verifiedBy: { type: String, default: null, trim: true },
+      verificationError: { type: String, default: null, trim: true },
       verifiedAt: { type: Date, default: null },
     },
     daraja: {
@@ -146,6 +164,15 @@ const mpesaTransactionSchema = new mongoose.Schema(
 
 mpesaTransactionSchema.index({ userAddress: 1, createdAt: -1 });
 mpesaTransactionSchema.index({ flowType: 1, status: 1, createdAt: -1 });
+mpesaTransactionSchema.index(
+  { "onchain.txHash": 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      "onchain.txHash": { $type: "string" },
+    },
+  }
+);
 mpesaTransactionSchema.index(
   { userAddress: 1, flowType: 1, idempotencyKey: 1 },
   {
