@@ -4,6 +4,7 @@ const { ethers } = require("ethers");
 const { connectDB } = require("../config/db");
 const { mpesaConfig } = require("../config/mpesa");
 const { MpesaTransaction } = require("../models/MpesaTransaction");
+const User = require("../models/User");
 const { requireBackendAuth } = require("../middleware/requireBackendAuth");
 const { requireIdempotencyKey } = require("../middleware/idempotency");
 const { buildQuote, isQuoteExpired } = require("../services/mpesa/quoteService");
@@ -19,11 +20,13 @@ const {
   calculateExpectedFundingFromQuote,
   verifyUsdcFunding,
 } = require("../services/settlement/verifyUsdcFunding");
+const { verifyPin } = require("../services/security/pin");
 
 const router = express.Router();
 
 const FLOWS = ["onramp", "offramp", "paybill", "buygoods"];
 const FUNDED_FLOWS = new Set(["offramp", "paybill", "buygoods"]);
+const APP_PIN_LENGTH = 6;
 
 function normalizeAddress(value) {
   return String(value || "").trim().toLowerCase();
@@ -130,8 +133,9 @@ function ensureSensitiveAuth(body) {
   const pin = String(body?.pin || "").trim();
   const signature = String(body?.signature || "").trim();
   const nonce = String(body?.nonce || "").trim();
-  if (!pin || pin.length < mpesaConfig.security.pinMinLength) {
-    throw new Error(`pin is required and must be at least ${mpesaConfig.security.pinMinLength} digits.`);
+  const expectedLen = APP_PIN_LENGTH;
+  if (!pin || pin.length !== expectedLen) {
+    throw new Error(`pin is required and must be exactly ${expectedLen} digits.`);
   }
   if (!/^\d+$/.test(pin)) {
     throw new Error("pin must contain digits only.");
@@ -163,6 +167,19 @@ function ensureSensitiveAuth(body) {
     signedAtRaw,
     nonce,
   };
+}
+
+async function requireUserPinVerified(userAddress, pin) {
+  const address = normalizeAddress(userAddress);
+  const user = await User.findOne({ address });
+  if (!user || !user.pinHash) {
+    throw new Error("Security PIN is not set. Please set a 6-digit app PIN to continue.");
+  }
+
+  const ok = verifyPin(pin, user.pinHash, { length: APP_PIN_LENGTH });
+  if (!ok) {
+    throw new Error("Invalid PIN.");
+  }
 }
 
 function targetDescriptor(tx) {
@@ -654,6 +671,7 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
     }
 
     const auth = ensureSensitiveAuth(req.body);
+    await requireUserPinVerified(userAddress, auth.pin);
     const phoneNumber = normalizePhone(req.body?.phoneNumber);
     if (!isValidPhone(phoneNumber)) {
       return res.status(400).json({ success: false, message: "phoneNumber must be in 2547XXXXXXXX format." });
@@ -752,6 +770,7 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
     }
 
     const auth = ensureSensitiveAuth(req.body);
+    await requireUserPinVerified(userAddress, auth.pin);
     const paybillNumber = normalizeNumber(req.body?.paybillNumber);
     const accountReference = normalizeNumber(req.body?.accountReference);
 
@@ -865,6 +884,7 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
     }
 
     const auth = ensureSensitiveAuth(req.body);
+    await requireUserPinVerified(userAddress, auth.pin);
     const tillNumber = normalizeNumber(req.body?.tillNumber);
 
     if (!/^\d{5,8}$/.test(tillNumber)) {

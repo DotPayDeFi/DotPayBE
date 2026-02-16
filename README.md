@@ -144,6 +144,8 @@ See `DotPayBE/.env.example` for the full list. Key groups:
 - `POST /api/users`
 - `GET /api/users/:address`
 - `PATCH /api/users/:address/identity`
+- `GET /api/users/:address/pin` (auth required, self only)
+- `PATCH /api/users/:address/pin` (auth required, self only; sets/updates 6-digit PIN)
 
 ### M-Pesa (Daraja)
 

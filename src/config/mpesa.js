@@ -160,7 +160,8 @@ const mpesaConfig = {
     autoRefund: toBool(process.env.MPESA_AUTO_REFUND, true),
   },
   security: {
-    pinMinLength: toNumber(process.env.MPESA_PIN_MIN_LENGTH, 4),
+    // DotPay uses a fixed-length app PIN (6 digits) for sensitive flows.
+    pinMinLength: toNumber(process.env.MPESA_PIN_MIN_LENGTH, 6),
     signatureMaxAgeSeconds: toNumber(process.env.MPESA_SIGNATURE_MAX_AGE_SECONDS, 600),
   },
   treasury: {
