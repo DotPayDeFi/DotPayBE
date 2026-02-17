@@ -21,6 +21,41 @@ function normalizePhone(value) {
   return value.trim().replace(/[\s()-]/g, "");
 }
 
+function expandPhoneLookups(raw) {
+  const normalized = normalizePhone(raw);
+  const digits = normalized.replace(/[^0-9]/g, "");
+  const variants = new Set();
+
+  if (!digits) return [];
+
+  variants.add(normalized);
+  variants.add(digits);
+  if (!normalized.startsWith("+")) variants.add(`+${digits}`);
+
+  // Kenya-specific normalizations:
+  // - 0712345678 -> 254712345678 / +254712345678
+  // - 712345678  -> 254712345678 / +254712345678
+  // - 254712345678 -> +254712345678
+  let ke = null;
+  if (digits.startsWith("254") && digits.length === 12) {
+    ke = digits;
+  } else if ((digits.startsWith("07") || digits.startsWith("01")) && digits.length === 10) {
+    ke = `254${digits.slice(1)}`;
+  } else if ((digits.startsWith("7") || digits.startsWith("1")) && digits.length === 9) {
+    ke = `254${digits}`;
+  }
+
+  if (ke) {
+    variants.add(ke);
+    variants.add(`+${ke}`);
+  }
+
+  return Array.from(variants)
+    .map((v) => String(v || "").trim())
+    .filter(Boolean)
+    .map((v) => ({ phone: v }));
+}
+
 function normalizeAddress(value) {
   if (typeof value !== "string") return "";
   return value.trim().toLowerCase();
@@ -346,9 +381,7 @@ router.get("/lookup", async (req, res) => {
 
     // Phone (store format can vary; try a few common normalizations)
     if (phoneDigits.length >= 7) {
-      lookups.push({ phone: normalizedPhone });
-      if (normalizedPhone !== phoneDigits) lookups.push({ phone: phoneDigits });
-      if (!normalizedPhone.startsWith("+")) lookups.push({ phone: `+${phoneDigits}` });
+      lookups.push(...expandPhoneLookups(q));
     }
 
     if (lookups.length === 0) {
