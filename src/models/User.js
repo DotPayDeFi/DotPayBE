@@ -47,6 +47,25 @@ const userSchema = new mongoose.Schema(
      */
     pinHash: { type: String, default: null, trim: true },
     pinUpdatedAt: { type: Date, default: null },
+
+    /**
+     * One-time welcome grant to help users test the app on Arbitrum Sepolia.
+     * This is best-effort and should not block onboarding if it fails.
+     */
+    welcomeUsdc: {
+      amount: { type: Number, default: null },
+      chainId: { type: Number, default: null },
+      tokenAddress: { type: String, default: null, trim: true, lowercase: true },
+      status: {
+        type: String,
+        enum: ["pending", "submitted", "succeeded", "failed", null],
+        default: null,
+      },
+      txHash: { type: String, default: null, trim: true, lowercase: true },
+      error: { type: String, default: null, trim: true },
+      issuedAt: { type: Date, default: null },
+      confirmedAt: { type: Date, default: null },
+    },
   },
   {
     timestamps: true,

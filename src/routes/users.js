@@ -3,12 +3,32 @@ const User = require("../models/User");
 const { connectDB } = require("../config/db");
 const { requireBackendAuth } = require("../middleware/requireBackendAuth");
 const { assertPinFormat, hashPin, verifyPin } = require("../services/security/pin");
+const { maybeIssueWelcomeUsdcForUser } = require("../services/faucet/welcomeUsdc");
 
 const router = express.Router();
 const USERNAME_REGEX = /^[a-z0-9_]{3,20}$/;
 const DOTPAY_ID_PREFIX_REGEX = /^dp/i;
 const ETH_ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const APP_PIN_LENGTH = 6;
+
+function requireInternalKey(req, res, next) {
+  const expected = String(process.env.DOTPAY_INTERNAL_API_KEY || "").trim();
+  if (!expected) {
+    return res.status(500).json({ success: false, message: "DOTPAY_INTERNAL_API_KEY is not configured." });
+  }
+
+  const provided =
+    String(req.get("x-dotpay-internal-key") || "").trim() ||
+    (String(req.get("authorization") || "").toLowerCase().startsWith("bearer ")
+      ? String(req.get("authorization") || "").slice(7).trim()
+      : "");
+
+  if (!provided || provided !== expected) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  return next();
+}
 
 function normalizeEmail(value) {
   if (typeof value !== "string") return "";
@@ -113,7 +133,7 @@ function requireSelfAddress(req, res, normalizedAddress) {
  * Create or update user from DotPay sign-in/sign-up (session user payload).
  * Body: { address, email?, phone?, userId?, authMethod?, createdAt?, username? }
  */
-router.post("/", async (req, res) => {
+router.post("/", requireInternalKey, async (req, res) => {
   try {
     await connectDB();
 
@@ -147,6 +167,7 @@ router.post("/", async (req, res) => {
     }
 
     let user = await User.findOne({ address: normalizedAddress });
+    const isNewUser = !user;
 
     if (!user) {
       const userData = {
@@ -174,6 +195,20 @@ router.post("/", async (req, res) => {
     }
 
     await user.save();
+
+    // Welcome faucet grant (best-effort, should not block onboarding).
+    // If enabled, send 2 USDC to NEW signups only for testing.
+    try {
+      if (isNewUser) {
+        const touched = await maybeIssueWelcomeUsdcForUser(user);
+        if (touched || user.isModified("welcomeUsdc")) {
+          await user.save();
+        }
+      }
+    } catch (err) {
+      // Never fail signup because of the faucet. Log for debugging.
+      console.warn("Welcome USDC grant skipped/failed:", err?.message || err);
+    }
 
     return res.status(200).json({
       success: true,
