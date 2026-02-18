@@ -19,7 +19,6 @@ const userSchema = new mongoose.Schema(
     /** Public username chosen by the user during onboarding. */
     username: {
       type: String,
-      default: null,
       trim: true,
       lowercase: true,
       minlength: 3,
