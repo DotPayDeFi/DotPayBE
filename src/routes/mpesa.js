@@ -140,8 +140,10 @@ function ensureSensitiveAuth(body) {
   if (!/^\d+$/.test(pin)) {
     throw new Error("pin must contain digits only.");
   }
-  if (!signature || signature.length < 24) {
-    throw new Error("signature is required.");
+  // thirdweb smart accounts may return EIP-1271 signatures (longer than 65 bytes),
+  // but they should still be 0x-prefixed hex.
+  if (!signature || !/^0x[0-9a-fA-F]{130,}$/.test(signature)) {
+    throw new Error("signature is required and must be a 0x-prefixed hex string.");
   }
   if (!nonce || nonce.length < 8) {
     throw new Error("nonce is required and must be at least 8 characters.");
@@ -207,21 +209,66 @@ function buildAuthorizationMessage({ tx, signedAtRaw, nonce }) {
   ].join("\n");
 }
 
-function verifyAuthorizationSignature({ tx, userAddress, signature, signedAtRaw, nonce }) {
+const EIP1271_MAGIC_VALUE = "0x1626ba7e";
+const EIP1271_ABI = [
+  "function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4 magicValue)",
+];
+
+let signatureProvider = null;
+let signatureProviderRpcUrl = null;
+
+function getSignatureProvider() {
+  const rpcUrl = String(mpesaConfig.treasury?.rpcUrl || "").trim();
+  if (!rpcUrl) return null;
+
+  if (signatureProvider && signatureProviderRpcUrl === rpcUrl) {
+    return signatureProvider;
+  }
+
+  signatureProviderRpcUrl = rpcUrl;
+  signatureProvider = new ethers.JsonRpcProvider(rpcUrl);
+  return signatureProvider;
+}
+
+async function verifyAuthorizationSignature({ tx, userAddress, signature, signedAtRaw, nonce }) {
   const message = buildAuthorizationMessage({ tx, signedAtRaw, nonce });
   let recovered = "";
+  let recoveredError = null;
 
   try {
     recovered = String(ethers.verifyMessage(message, signature) || "").trim().toLowerCase();
-  } catch {
-    throw new Error("Invalid signature.");
+  } catch (err) {
+    recoveredError = err;
   }
 
-  if (!recovered || recovered !== userAddress) {
+  // EOA signatures recover directly to the sender address.
+  if (recovered && recovered === userAddress) {
+    return message;
+  }
+
+  // Smart accounts (ERC-4337, etc.) often use EIP-1271 contract signatures, which cannot be
+  // validated via `verifyMessage`. Fall back to on-chain signature validation.
+  const provider = getSignatureProvider();
+  if (provider) {
+    try {
+      const contract = new ethers.Contract(userAddress, EIP1271_ABI, provider);
+      const hash = ethers.hashMessage(message);
+      const magic = await contract.isValidSignature(hash, signature);
+      if (String(magic || "").trim().toLowerCase() === EIP1271_MAGIC_VALUE) {
+        return message;
+      }
+    } catch {
+      // ignore, we'll surface a consistent error below
+    }
+  }
+
+  if (recovered && recovered !== userAddress) {
     throw new Error("Signature does not match the authenticated wallet.");
   }
-
-  return message;
+  if (recoveredError) {
+    throw new Error("Invalid signature.");
+  }
+  throw new Error("Invalid signature.");
 }
 
 function applyFundingDefaults(tx) {
@@ -694,7 +741,7 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
       signedAt: auth.signedAt,
       nonce: auth.nonce,
     };
-    const signatureMessage = verifyAuthorizationSignature({
+    const signatureMessage = await verifyAuthorizationSignature({
       tx,
       userAddress,
       signature: auth.signature,
@@ -798,7 +845,7 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
       signedAt: auth.signedAt,
       nonce: auth.nonce,
     };
-    const signatureMessage = verifyAuthorizationSignature({
+    const signatureMessage = await verifyAuthorizationSignature({
       tx,
       userAddress,
       signature: auth.signature,
@@ -908,7 +955,7 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
       signedAt: auth.signedAt,
       nonce: auth.nonce,
     };
-    const signatureMessage = verifyAuthorizationSignature({
+    const signatureMessage = await verifyAuthorizationSignature({
       tx,
       userAddress,
       signature: auth.signature,
