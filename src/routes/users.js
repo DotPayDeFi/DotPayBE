@@ -149,16 +149,20 @@ router.post("/", async (req, res) => {
     let user = await User.findOne({ address: normalizedAddress });
 
     if (!user) {
-      user = new User({
+      const userData = {
         address: normalizedAddress,
         email: email ?? null,
         phone: normalizedPhone ?? null,
         thirdwebUserId: userId ?? null,
         authMethod: authMethod ?? null,
         thirdwebCreatedAt: createdAt ? new Date(createdAt) : null,
-        username: normalizedUsername || null,
         dotpayId: await generateUniqueDotpayId(),
-      });
+      };
+      // IMPORTANT: do not persist `username: null`. With a unique sparse index on `username`,
+      // multiple `null` values would trigger duplicate key errors and block new signups.
+      if (normalizedUsername) userData.username = normalizedUsername;
+
+      user = new User(userData);
     } else {
       if (email !== undefined) user.email = email ?? null;
       if (phone !== undefined) user.phone = normalizedPhone ?? null;
