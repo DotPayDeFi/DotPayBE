@@ -71,7 +71,6 @@ function getMpesaConfig() {
   const b2bShortcode = getEnvValue("MPESA_B2B_SHORTCODE") || shortcode;
   const webhookBase = getEnvValue("MPESA_WEBHOOK_URL");
   const callbackToken = getEnvValue("MPESA_CALLBACK_TOKEN");
-  const authToken = getEnvValue("MPESA_API_BEARER_TOKEN");
 
   return {
     env,
@@ -87,7 +86,6 @@ function getMpesaConfig() {
     b2bShortcode,
     webhookBase,
     callbackToken,
-    authToken,
     b2cUrl: getEnvValue("MPESA_B2C_URL") || `${baseUrl}/mpesa/b2c/v1/paymentrequest`,
     b2bUrl: getEnvValue("MPESA_B2B_URL") || `${baseUrl}/mpesa/b2b/v1/paymentrequest`,
   };
@@ -334,4 +332,3 @@ module.exports = {
   hasValidClientBearer,
   getMpesaConfig,
 };
-
