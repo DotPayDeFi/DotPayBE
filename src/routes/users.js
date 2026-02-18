@@ -284,6 +284,51 @@ router.patch("/:address/pin", requireBackendAuth, async (req, res) => {
 });
 
 /**
+ * POST /api/users/:address/pin/verify
+ * Verify a 6-digit app PIN for the authenticated user.
+ *
+ * Body: { pin }
+ */
+router.post("/:address/pin/verify", requireBackendAuth, async (req, res) => {
+  try {
+    await connectDB();
+
+    const normalizedAddress = normalizeAddress(req.params.address);
+    if (!normalizedAddress) {
+      return res.status(400).json({ success: false, message: "address is required" });
+    }
+    if (!requireSelfAddress(req, res, normalizedAddress)) return;
+
+    const pin = assertPinFormat(req.body?.pin, APP_PIN_LENGTH);
+
+    const user = await User.findOne({ address: normalizedAddress });
+    if (!user || !user.pinHash) {
+      return res.status(400).json({
+        success: false,
+        message: "Security PIN is not set. Please set a 6-digit app PIN to continue.",
+      });
+    }
+
+    const ok = verifyPin(pin, user.pinHash, { length: APP_PIN_LENGTH });
+    if (!ok) {
+      return res.status(401).json({ success: false, message: "Invalid PIN." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        address: user.address,
+        valid: true,
+        pinUpdatedAt: user.pinUpdatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("POST /api/users/:address/pin/verify error:", err);
+    return res.status(500).json({ success: false, message: err.message || "Failed to verify PIN" });
+  }
+});
+
+/**
  * PATCH /api/users/:address/identity
  * Set username and ensure DotPay ID exists.
  * Body: { username }
