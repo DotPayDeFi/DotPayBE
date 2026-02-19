@@ -11,8 +11,11 @@ const {
 
 const RECEIPT_REGEX = /^[A-Z0-9]{10}$/i;
 const DIGITS_REGEX = /^[0-9]+$/;
+const ETH_HASH_REGEX = /^0x[a-fA-F0-9]{64}$/;
+const ETH_ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const DEFAULT_KES_PER_USD = Number.parseFloat(process.env.KES_PER_USD || "130");
 const DEFAULT_B2C_COMMAND_ID = String(process.env.MPESA_B2C_COMMAND_ID || "").trim();
+const REQUIRE_ONCHAIN_FUNDING = String(process.env.MPESA_REQUIRE_ONCHAIN_FUNDING || "").trim().toLowerCase() === "true";
 
 function nowIso() {
   return new Date().toISOString();
@@ -58,6 +61,23 @@ function extractPhone(body) {
 function normalizeTargetNumber(value) {
   const normalized = String(value || "").trim();
   return DIGITS_REGEX.test(normalized) ? normalized : "";
+}
+
+function normalizeTxHash(value) {
+  const normalized = String(value || "").trim();
+  return ETH_HASH_REGEX.test(normalized) ? normalized : "";
+}
+
+function normalizeEvmAddress(value) {
+  const normalized = String(value || "").trim();
+  return ETH_ADDRESS_REGEX.test(normalized) ? normalized.toLowerCase() : "";
+}
+
+function parseUsdcAmount(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const amount = Number.parseFloat(String(value));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return Number(amount.toFixed(6));
 }
 
 async function createTransaction(input) {
@@ -156,12 +176,18 @@ async function handleC2BStk({ req, res, product, accountReference, transactionDe
 async function handleB2C({ req, res, product }) {
   const amount = parseAmount(req.body?.amount, { min: 10, max: 150000 });
   const phoneNumber = extractPhone(req.body);
+  const treasuryTransferHash = normalizeTxHash(req.body?.treasuryTransferHash || req.body?.cryptoTransactionHash);
+  const treasuryAddress = normalizeEvmAddress(req.body?.treasuryAddress || process.env.TREASURY_PLATFORM_ADDRESS);
+  const usdcAmount = parseUsdcAmount(req.body?.usdcAmount || req.body?.cryptoAmount);
 
   if (!amount) {
     return fail(res, 400, "Invalid amount. Must be between 10 and 150000 KES.");
   }
   if (!phoneNumber || !isValidKenyanMsisdn(phoneNumber)) {
     return fail(res, 400, "Invalid phone number.");
+  }
+  if (REQUIRE_ONCHAIN_FUNDING && !treasuryTransferHash) {
+    return fail(res, 400, "treasuryTransferHash is required before M-Pesa withdrawal.");
   }
 
   const transactionId = randomUUID();
@@ -182,6 +208,9 @@ async function handleB2C({ req, res, product }) {
       phoneNumber,
       tokenType,
       chain,
+      usdcAmount,
+      treasuryAddress: treasuryAddress || null,
+      treasuryTransferHash: treasuryTransferHash || null,
       remarks: req.body?.description || req.body?.remarks || null,
     }),
   });
@@ -218,6 +247,9 @@ async function handleB2C({ req, res, product }) {
         recipientPhone: phoneNumber,
         tokenType,
         chain: chain || "unknown",
+        usdcAmount,
+        treasuryAddress: treasuryAddress || null,
+        treasuryTransferHash: treasuryTransferHash || null,
       },
       estimatedCompletionTime: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
     });

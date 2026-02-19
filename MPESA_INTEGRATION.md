@@ -29,6 +29,16 @@ Both trigger STK push (`CustomerPayBillOnline`) and store state in `MpesaTransac
 
 Both trigger B2C payment requests and track callback state.
 
+### Offramp (USDC -> Treasury -> M-Pesa)
+
+For `POST /api/mpesa/crypto-to-mpesa`, backend accepts optional funding metadata:
+
+- `usdcAmount`
+- `treasuryAddress`
+- `treasuryTransferHash` (or `cryptoTransactionHash`)
+
+If `MPESA_REQUIRE_ONCHAIN_FUNDING=true`, `treasuryTransferHash` is required before B2C request is sent to Daraja.
+
 ### B2B
 
 - `POST /api/mpesa/pay/paybill` (`BusinessPayBill`)
@@ -75,3 +85,7 @@ Use `.env.example` as source of truth. At minimum set:
 
 For production, also set corresponding `MPESA_PROD_*` keys and switch `MPESA_ENV=production`.
 
+Additional offramp controls:
+
+- `MPESA_REQUIRE_ONCHAIN_FUNDING=true|false`
+- `TREASURY_PLATFORM_ADDRESS=0x...`
