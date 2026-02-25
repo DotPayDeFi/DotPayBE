@@ -20,6 +20,7 @@ const {
   calculateExpectedFundingFromQuote,
   verifyUsdcFunding,
 } = require("../services/settlement/verifyUsdcFunding");
+const { hasTreasuryTransferConfig } = require("../services/settlement/treasurySettlement");
 const { verifyPin } = require("../services/security/pin");
 
 const router = express.Router();
@@ -61,6 +62,44 @@ function formatFixed(value, decimals) {
   return n.toFixed(decimals);
 }
 
+function summarizeRequestPayload(body) {
+  const src = body && typeof body === "object" ? body : {};
+  const out = {};
+  const copy = (key) => {
+    if (src[key] !== undefined && src[key] !== null && src[key] !== "") {
+      out[key] = src[key];
+    }
+  };
+
+  copy("flowType");
+  copy("quoteId");
+  copy("amount");
+  copy("currency");
+  copy("phoneNumber");
+  copy("paybillNumber");
+  copy("tillNumber");
+  copy("accountReference");
+  copy("businessId");
+  copy("chainId");
+  copy("onchainTxHash");
+
+  if (src.pin !== undefined) {
+    out.pin = String(src.pin || "").trim() ? "provided" : "missing";
+  }
+  if (src.signature !== undefined) {
+    const len = String(src.signature || "").trim().length;
+    out.signature = len > 0 ? `provided(len:${len})` : "missing";
+  }
+  if (src.nonce !== undefined) {
+    out.nonce = String(src.nonce || "").trim() ? "provided" : "missing";
+  }
+  if (src.signedAt !== undefined) {
+    out.signedAt = String(src.signedAt || "").trim() ? "provided" : "missing";
+  }
+
+  return out;
+}
+
 function isValidPhone(phone) {
   return /^254\d{9}$/.test(phone);
 }
@@ -77,7 +116,9 @@ function requireMpesaEnabled(req, res) {
 }
 
 function requiresOnchainFunding(flowType) {
-  return Boolean(mpesaConfig.settlement?.requireOnchainFunding) && FUNDED_FLOWS.has(flowType);
+  // Always require user-funded on-chain proof for outbound M-Pesa flows so receipts
+  // consistently include a funding transaction hash.
+  return FUNDED_FLOWS.has(flowType);
 }
 
 function mapTransaction(tx) {
@@ -311,7 +352,14 @@ function applyFundingDefaults(tx) {
   tx.onchain.expectedAmountUnits = expectedUnitsString;
 }
 
-async function enforceLimits(userAddress, amountKes) {
+async function enforceLimits(userAddress, amountKes, flowType = "") {
+  const minTxnKes = Number(mpesaConfig.limits?.minTxnKes || 1);
+  // M-Pesa payout products commonly enforce minimum transfer limits.
+  // Validate early so users see a clear error before external submission.
+  if (flowType !== "onramp" && amountKes < minTxnKes) {
+    throw new Error(`Amount is below per-transaction minimum of ${minTxnKes} KES.`);
+  }
+
   if (amountKes > mpesaConfig.limits.maxTxnKes) {
     throw new Error(`Amount exceeds per-transaction limit of ${mpesaConfig.limits.maxTxnKes} KES.`);
   }
@@ -380,6 +428,8 @@ async function fetchOrCreateQuoteTransaction({
       currency,
       kesPerUsd: body?.kesPerUsd,
     });
+
+    await enforceLimits(userAddress, quote.amountKes, flowType);
 
     tx = await MpesaTransaction.create({
       flowType,
@@ -573,6 +623,35 @@ router.post("/internal/reconcile", requireInternalKey, async (req, res) => {
 
 router.use(requireBackendAuth);
 
+router.use((req, res, next) => {
+  const requestId = crypto.randomUUID().split("-")[0];
+  const startedAt = Date.now();
+  const idempotency = String(req.get("idempotency-key") || "").trim();
+  const userAddress = normalizeAddress(req.backendAuth?.address || "");
+  const payloadSummary = summarizeRequestPayload(req.body);
+
+  console.info(
+    `[M-Pesa API] req=${requestId} start method=${req.method} path=${req.originalUrl} user=${
+      userAddress || "-"
+    } idem=${idempotency || "-"} payload=${JSON.stringify(payloadSummary)}`
+  );
+
+  let completed = false;
+  const finish = (eventName) => {
+    if (completed) return;
+    completed = true;
+    console.info(
+      `[M-Pesa API] req=${requestId} ${eventName} status=${res.statusCode} durationMs=${
+        Date.now() - startedAt
+      }`
+    );
+  };
+
+  res.on("finish", () => finish("finish"));
+  res.on("close", () => finish("close"));
+  next();
+});
+
 /**
  * POST /api/mpesa/quotes
  */
@@ -596,7 +675,7 @@ router.post("/quotes", async (req, res) => {
       kesPerUsd: req.body?.kesPerUsd,
     });
 
-    await enforceLimits(userAddress, quote.amountKes);
+    await enforceLimits(userAddress, quote.amountKes, flowType);
 
     const tx = await MpesaTransaction.create({
       flowType,
@@ -621,6 +700,10 @@ router.post("/quotes", async (req, res) => {
     applyFundingDefaults(tx);
     await tx.save();
 
+    console.info(
+      `[M-Pesa Quote] tx=${tx.transactionId} flow=${flowType} user=${userAddress} amountKes=${tx.quote?.amountKes || 0} totalDebitKes=${tx.quote?.totalDebitKes || 0} onchainRequired=${Boolean(tx.onchain?.required)}`
+    );
+
     return res.status(200).json({
       success: true,
       data: {
@@ -629,6 +712,7 @@ router.post("/quotes", async (req, res) => {
       },
     });
   } catch (err) {
+    console.error(`[M-Pesa Quote] failed reason=${err.message || err}`);
     return res.status(400).json({ success: false, message: err.message || "Failed to generate quote." });
   }
 });
@@ -639,6 +723,13 @@ router.post("/quotes", async (req, res) => {
 router.post("/onramp/stk/initiate", requireIdempotencyKey, async (req, res) => {
   try {
     if (!requireMpesaEnabled(req, res)) return;
+    if (!hasTreasuryTransferConfig()) {
+      return res.status(503).json({
+        success: false,
+        message:
+          "Top-up settlement is not configured. Set TREASURY_RPC_URL, TREASURY_PRIVATE_KEY, and TREASURY_USDC_CONTRACT.",
+      });
+    }
 
     const userAddress = normalizeAddress(req.backendAuth.address);
     const idempotencyKey = req.idempotencyKey;
@@ -660,6 +751,10 @@ router.post("/onramp/stk/initiate", requireIdempotencyKey, async (req, res) => {
       idempotencyKey,
     });
 
+    console.info(
+      `[M-Pesa Onramp] start tx=${tx.transactionId} user=${userAddress} amountKes=${tx.quote?.amountKes || 0} phone=${phoneNumber}`
+    );
+
     tx.idempotencyKey = idempotencyKey;
     tx.targets = { ...tx.targets, phoneNumber };
     assertTransition(tx, "mpesa_submitted", "Submitting STK push", "api");
@@ -673,6 +768,12 @@ router.post("/onramp/stk/initiate", requireIdempotencyKey, async (req, res) => {
       transactionDesc: "DotPay wallet top up",
       transactionType: "CustomerPayBillOnline",
     });
+
+    console.info(
+      `[M-Pesa STK] tx=${tx.transactionId} httpStatus=${darajaRes.status} responseCode=${String(
+        darajaRes.data?.ResponseCode || ""
+      )} checkoutRequestId=${darajaRes.data?.CheckoutRequestID || "-"}`
+    );
 
     tx.daraja = {
       ...(tx.daraja || {}),
@@ -691,6 +792,11 @@ router.post("/onramp/stk/initiate", requireIdempotencyKey, async (req, res) => {
     if (darajaRes.ok && String(darajaRes.data?.ResponseCode || "") === "0") {
       assertTransition(tx, "mpesa_processing", "STK request accepted", "daraja");
     } else {
+      console.warn(
+        `[M-Pesa STK] tx=${tx.transactionId} rejected response=${JSON.stringify(
+          darajaRes.data || {}
+        )}`
+      );
       assertTransition(tx, "failed", "STK request rejected", "daraja");
     }
 
@@ -698,6 +804,7 @@ router.post("/onramp/stk/initiate", requireIdempotencyKey, async (req, res) => {
 
     return res.status(200).json({ success: true, data: mapTransaction(tx) });
   } catch (err) {
+    console.error(`[M-Pesa Onramp] failed reason=${err.message || err}`);
     return res.status(400).json({ success: false, message: err.message || "Failed to initiate onramp." });
   }
 });
@@ -730,6 +837,10 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
       body: req.body,
       idempotencyKey,
     });
+
+    console.info(
+      `[M-Pesa Offramp] start tx=${tx.transactionId} user=${userAddress} amountKes=${tx.quote?.amountKes || 0} expectedKes=${tx.quote?.expectedReceiveKes || 0} phone=${phoneNumber}`
+    );
 
     tx.idempotencyKey = idempotencyKey;
     tx.businessId = req.body?.businessId ? String(req.body.businessId).trim() : tx.businessId;
@@ -772,6 +883,14 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
       commandId: mpesaConfig.commands?.b2cOfframp || "BusinessPayment",
     });
 
+    console.info(
+      `[M-Pesa B2C] tx=${tx.transactionId} httpStatus=${darajaRes.status} responseCode=${String(
+        darajaRes.data?.ResponseCode || ""
+      )} conversationId=${darajaRes.data?.ConversationID || "-"} originatorConversationId=${
+        darajaRes.data?.OriginatorConversationID || tx.transactionId
+      } resultUrl=${resultUrl} timeoutUrl=${timeoutUrl}`
+    );
+
     tx.daraja = {
       ...(tx.daraja || {}),
       responseCode: String(darajaRes.data?.ResponseCode || ""),
@@ -790,6 +909,11 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
       assertTransition(tx, "mpesa_processing", "B2C request accepted", "daraja");
       await tx.save();
     } else {
+      console.warn(
+        `[M-Pesa B2C] tx=${tx.transactionId} rejected response=${JSON.stringify(
+          darajaRes.data || {}
+        )}`
+      );
       assertTransition(tx, "failed", "B2C request rejected", "daraja");
       await tx.save();
       await scheduleAutoRefund(tx, "B2C request rejected");
@@ -797,6 +921,7 @@ router.post("/offramp/initiate", requireIdempotencyKey, async (req, res) => {
 
     return res.status(200).json({ success: true, data: mapTransaction(tx) });
   } catch (err) {
+    console.error(`[M-Pesa Offramp] failed reason=${err.message || err}`);
     return res.status(400).json({ success: false, message: err.message || "Failed to initiate offramp." });
   }
 });
@@ -834,6 +959,10 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
       body: req.body,
       idempotencyKey,
     });
+
+    console.info(
+      `[M-Pesa Paybill] start tx=${tx.transactionId} user=${userAddress} amountKes=${tx.quote?.amountKes || 0} paybill=${paybillNumber}`
+    );
 
     tx.idempotencyKey = idempotencyKey;
     tx.businessId = req.body?.businessId ? String(req.body.businessId).trim() : tx.businessId;
@@ -886,6 +1015,14 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
         "",
     });
 
+    console.info(
+      `[M-Pesa B2B Paybill] tx=${tx.transactionId} httpStatus=${darajaRes.status} responseCode=${String(
+        darajaRes.data?.ResponseCode || ""
+      )} conversationId=${darajaRes.data?.ConversationID || "-"} originatorConversationId=${
+        darajaRes.data?.OriginatorConversationID || tx.transactionId
+      }`
+    );
+
     tx.daraja = {
       ...(tx.daraja || {}),
       responseCode: String(darajaRes.data?.ResponseCode || ""),
@@ -904,6 +1041,11 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
       assertTransition(tx, "mpesa_processing", "B2B paybill accepted", "daraja");
       await tx.save();
     } else {
+      console.warn(
+        `[M-Pesa B2B Paybill] tx=${tx.transactionId} rejected response=${JSON.stringify(
+          darajaRes.data || {}
+        )}`
+      );
       assertTransition(tx, "failed", "B2B paybill rejected", "daraja");
       await tx.save();
       await scheduleAutoRefund(tx, "B2B paybill rejected");
@@ -911,6 +1053,7 @@ router.post("/merchant/paybill/initiate", requireIdempotencyKey, async (req, res
 
     return res.status(200).json({ success: true, data: mapTransaction(tx) });
   } catch (err) {
+    console.error(`[M-Pesa Paybill] failed reason=${err.message || err}`);
     return res.status(400).json({ success: false, message: err.message || "Failed to initiate paybill." });
   }
 });
@@ -944,6 +1087,10 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
       body: req.body,
       idempotencyKey,
     });
+
+    console.info(
+      `[M-Pesa BuyGoods] start tx=${tx.transactionId} user=${userAddress} amountKes=${tx.quote?.amountKes || 0} till=${tillNumber}`
+    );
 
     tx.idempotencyKey = idempotencyKey;
     tx.businessId = req.body?.businessId ? String(req.body.businessId).trim() : tx.businessId;
@@ -998,6 +1145,14 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
         "",
     });
 
+    console.info(
+      `[M-Pesa B2B BuyGoods] tx=${tx.transactionId} httpStatus=${darajaRes.status} responseCode=${String(
+        darajaRes.data?.ResponseCode || ""
+      )} conversationId=${darajaRes.data?.ConversationID || "-"} originatorConversationId=${
+        darajaRes.data?.OriginatorConversationID || tx.transactionId
+      }`
+    );
+
     tx.daraja = {
       ...(tx.daraja || {}),
       responseCode: String(darajaRes.data?.ResponseCode || ""),
@@ -1016,6 +1171,11 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
       assertTransition(tx, "mpesa_processing", "B2B buygoods accepted", "daraja");
       await tx.save();
     } else {
+      console.warn(
+        `[M-Pesa B2B BuyGoods] tx=${tx.transactionId} rejected response=${JSON.stringify(
+          darajaRes.data || {}
+        )}`
+      );
       assertTransition(tx, "failed", "B2B buygoods rejected", "daraja");
       await tx.save();
       await scheduleAutoRefund(tx, "B2B buygoods rejected");
@@ -1023,6 +1183,7 @@ router.post("/merchant/buygoods/initiate", requireIdempotencyKey, async (req, re
 
     return res.status(200).json({ success: true, data: mapTransaction(tx) });
   } catch (err) {
+    console.error(`[M-Pesa BuyGoods] failed reason=${err.message || err}`);
     return res.status(400).json({ success: false, message: err.message || "Failed to initiate buygoods." });
   }
 });

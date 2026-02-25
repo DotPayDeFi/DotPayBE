@@ -30,7 +30,7 @@ sequenceDiagram
 Notes:
 
 - For `offramp`, `paybill`, and `buygoods` we support **user-push funding** (frontend sends the USDC on-chain; backend verifies).
-- `onramp` (STK Push top up) currently tracks the M-Pesa leg only; wallet crediting is a separate step to implement.
+- For `onramp` (STK Push top up), backend now settles USDC from treasury to the user wallet after successful STK callback and stores the on-chain tx hash on the transaction.
 
 ## Requirements
 

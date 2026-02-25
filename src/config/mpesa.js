@@ -32,6 +32,18 @@ function pickMpesaEnvValue(suffix, fallback = "") {
   return String(fallback || "").trim();
 }
 
+function pickMpesaScopedValue(suffix, fallback = "") {
+  const envScoped = String(process.env[`${envPrefix}${suffix}`] || "").trim();
+  if (envScoped) return envScoped;
+  return String(fallback || "").trim();
+}
+
+function pickMpesaGenericValue(suffix, fallback = "") {
+  const generic = String(process.env[`MPESA_${suffix}`] || "").trim();
+  if (generic) return generic;
+  return String(fallback || "").trim();
+}
+
 function defaultCertPathForEnv(targetEnv) {
   // Only sandbox cert is bundled; production should be supplied via MPESA_CERT_PATH.
   if (targetEnv === "sandbox") return path.join(__dirname, "../assets/mpesa-sandbox-cert.cer");
@@ -111,38 +123,56 @@ const mpesaConfig = {
 
     // Optional per-product overrides (some Daraja apps issue different initiators/credentials per API product).
     b2cInitiatorName:
-      pickMpesaEnvValue("B2C_INITIATOR_NAME") ||
-      pickMpesaEnvValue("INITIATOR_NAME"),
+      pickMpesaScopedValue("B2C_INITIATOR_NAME") ||
+      pickMpesaScopedValue("INITIATOR_NAME") ||
+      pickMpesaGenericValue("B2C_INITIATOR_NAME") ||
+      pickMpesaGenericValue("INITIATOR_NAME"),
     b2cSecurityCredential:
-      pickMpesaEnvValue("B2C_SECURITY_CREDENTIAL") ||
-      securityCredential,
+      pickMpesaScopedValue("B2C_SECURITY_CREDENTIAL") ||
+      securityCredential ||
+      pickMpesaGenericValue("B2C_SECURITY_CREDENTIAL"),
     b2bInitiatorName:
-      pickMpesaEnvValue("B2B_INITIATOR_NAME") ||
-      pickMpesaEnvValue("INITIATOR_NAME"),
+      pickMpesaScopedValue("B2B_INITIATOR_NAME") ||
+      pickMpesaScopedValue("INITIATOR_NAME") ||
+      pickMpesaGenericValue("B2B_INITIATOR_NAME") ||
+      pickMpesaGenericValue("INITIATOR_NAME"),
     b2bSecurityCredential:
-      pickMpesaEnvValue("B2B_SECURITY_CREDENTIAL") ||
-      securityCredential,
+      pickMpesaScopedValue("B2B_SECURITY_CREDENTIAL") ||
+      securityCredential ||
+      pickMpesaGenericValue("B2B_SECURITY_CREDENTIAL"),
 
     // Optional per-flow B2B overrides.
     b2bPaybillInitiatorName:
-      pickMpesaEnvValue("B2B_PAYBILL_INITIATOR_NAME") ||
-      pickMpesaEnvValue("B2B_INITIATOR_NAME") ||
-      pickMpesaEnvValue("INITIATOR_NAME"),
+      pickMpesaScopedValue("B2B_PAYBILL_INITIATOR_NAME") ||
+      pickMpesaScopedValue("B2B_INITIATOR_NAME") ||
+      pickMpesaScopedValue("INITIATOR_NAME") ||
+      pickMpesaGenericValue("B2B_PAYBILL_INITIATOR_NAME") ||
+      pickMpesaGenericValue("B2B_INITIATOR_NAME") ||
+      pickMpesaGenericValue("INITIATOR_NAME"),
     b2bPaybillSecurityCredential:
-      pickMpesaEnvValue("B2B_PAYBILL_SECURITY_CREDENTIAL") ||
-      pickMpesaEnvValue("B2B_SECURITY_CREDENTIAL") ||
-      securityCredential,
+      pickMpesaScopedValue("B2B_PAYBILL_SECURITY_CREDENTIAL") ||
+      pickMpesaScopedValue("B2B_SECURITY_CREDENTIAL") ||
+      securityCredential ||
+      pickMpesaGenericValue("B2B_PAYBILL_SECURITY_CREDENTIAL") ||
+      pickMpesaGenericValue("B2B_SECURITY_CREDENTIAL"),
     b2bBuygoodsInitiatorName:
-      pickMpesaEnvValue("B2B_BUYGOODS_INITIATOR_NAME") ||
-      pickMpesaEnvValue("B2B_INITIATOR_NAME") ||
-      pickMpesaEnvValue("INITIATOR_NAME"),
+      pickMpesaScopedValue("B2B_BUYGOODS_INITIATOR_NAME") ||
+      pickMpesaScopedValue("B2B_INITIATOR_NAME") ||
+      pickMpesaScopedValue("INITIATOR_NAME") ||
+      pickMpesaGenericValue("B2B_BUYGOODS_INITIATOR_NAME") ||
+      pickMpesaGenericValue("B2B_INITIATOR_NAME") ||
+      pickMpesaGenericValue("INITIATOR_NAME"),
     b2bBuygoodsSecurityCredential:
-      pickMpesaEnvValue("B2B_BUYGOODS_SECURITY_CREDENTIAL") ||
-      pickMpesaEnvValue("B2B_SECURITY_CREDENTIAL") ||
-      securityCredential,
+      pickMpesaScopedValue("B2B_BUYGOODS_SECURITY_CREDENTIAL") ||
+      pickMpesaScopedValue("B2B_SECURITY_CREDENTIAL") ||
+      securityCredential ||
+      pickMpesaGenericValue("B2B_BUYGOODS_SECURITY_CREDENTIAL") ||
+      pickMpesaGenericValue("B2B_SECURITY_CREDENTIAL"),
 
     // Optional Requester for B2B payloads (commonly used in sandbox samples).
-    b2bRequester: pickMpesaEnvValue("B2B_REQUESTER"),
+    b2bRequester:
+      pickMpesaScopedValue("B2B_REQUESTER") ||
+      pickMpesaGenericValue("B2B_REQUESTER"),
   },
   commands: {
     b2cOfframp: String(process.env.MPESA_B2C_COMMAND_ID || "BusinessPayment").trim(),
@@ -158,6 +188,7 @@ const mpesaConfig = {
     webhookSecret: String(process.env.MPESA_WEBHOOK_SECRET || "").trim(),
   },
   limits: {
+    minTxnKes: Math.max(1, toNumber(process.env.MPESA_MIN_TXN_KES, 10)),
     maxTxnKes: toNumber(process.env.MPESA_MAX_TXN_KES, 150000),
     maxDailyKes: toNumber(process.env.MPESA_MAX_DAILY_KES, 500000),
   },

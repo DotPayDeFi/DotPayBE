@@ -5,6 +5,7 @@ const { MpesaTransaction } = require("../models/MpesaTransaction");
 const { MpesaEvent } = require("../models/MpesaEvent");
 const { assertTransition } = require("../services/mpesa/stateMachine");
 const { scheduleAutoRefund } = require("../services/mpesa/refundService");
+const { settleOnrampToUserWallet } = require("../services/settlement/treasurySettlement");
 
 const router = express.Router();
 
@@ -12,8 +13,30 @@ function normalizeTxId(value) {
   return String(value || "").trim().toUpperCase();
 }
 
+function createWebhookLogId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function callbackAck(res) {
   return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+}
+
+function normalizeResultCode(value) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim();
+}
+
+function withMpesaActionHint(code, resultDesc) {
+  const base = String(resultDesc || "").trim() || "M-Pesa request failed.";
+  const normalized = normalizeResultCode(code);
+
+  if (normalized === "8006") {
+    return `${base} Action required: reset/unlock the Daraja initiator security credential in Safaricom portal, then update MPESA_PROD_B2C_SECURITY_CREDENTIAL and retry.`;
+  }
+  if (normalized === "2001") {
+    return `${base} Action required: verify initiator name and security credential pairing for production B2C.`;
+  }
+  return base;
 }
 
 function parseResultCode(value) {
@@ -82,6 +105,38 @@ async function findTransactionFromWebhook(req, fallbackFields = {}) {
   return MpesaTransaction.findOne(query);
 }
 
+router.use((req, res, next) => {
+  if (!req.path.startsWith("/webhooks/")) {
+    return next("router");
+  }
+
+  const requestId = createWebhookLogId();
+  const startedAt = Date.now();
+  const txParam = String(req.query?.tx || "").trim() || "-";
+  const conversationId =
+    String(req.body?.Result?.ConversationID || req.body?.Body?.stkCallback?.CheckoutRequestID || "")
+      .trim() || "-";
+
+  console.info(
+    `[M-Pesa Webhook] req=${requestId} start method=${req.method} path=${req.originalUrl} tx=${txParam} ref=${conversationId}`
+  );
+
+  let completed = false;
+  const finish = (eventName) => {
+    if (completed) return;
+    completed = true;
+    console.info(
+      `[M-Pesa Webhook] req=${requestId} ${eventName} status=${res.statusCode} durationMs=${
+        Date.now() - startedAt
+      }`
+    );
+  };
+
+  res.on("finish", () => finish("finish"));
+  res.on("close", () => finish("close"));
+  next();
+});
+
 router.use(async (req, res, next) => {
   try {
     await connectDB();
@@ -142,6 +197,38 @@ router.post("/webhooks/stk", async (req, res) => {
     };
 
     if (parsedCode.isSuccess) {
+      try {
+        const settled = await settleOnrampToUserWallet(tx);
+        console.info(
+          `[M-Pesa Onramp Settlement] tx=${tx.transactionId} status=completed txHash=${
+            settled?.txHash || "-"
+          } reused=${Boolean(settled?.reused)}`
+        );
+      } catch (settlementErr) {
+        const reason = String(settlementErr?.message || "On-chain settlement failed.").trim();
+        console.error(
+          `[M-Pesa Onramp Settlement] tx=${tx.transactionId} status=failed reason=${reason}`
+        );
+
+        tx.onchain = {
+          ...(tx.onchain || {}),
+          verificationStatus: "failed",
+          verificationError: reason,
+          verifiedBy: "treasury_settlement",
+          verifiedAt: new Date(),
+        };
+        tx.daraja = {
+          ...(tx.daraja || {}),
+          resultDesc: `${resultDesc || "STK callback success"} | Settlement error: ${reason}`,
+        };
+        if (tx.status !== "failed") {
+          assertTransition(tx, "failed", "On-chain settlement failed", "settlement");
+        }
+
+        await tx.save();
+        return callbackAck(res);
+      }
+
       if (tx.status !== "succeeded") {
         assertTransition(tx, "succeeded", "STK callback success", "webhook");
       }
@@ -168,10 +255,15 @@ router.post("/webhooks/b2c/result", async (req, res) => {
     const conversationId = result?.ConversationID;
     const originatorConversationId = result?.OriginatorConversationID;
     const parsedCode = parseResultCode(result?.ResultCode);
-    const resultDesc = String(result?.ResultDesc || "").trim() || null;
+    const resultDescRaw = String(result?.ResultDesc || "").trim() || null;
+    const resultDesc = withMpesaActionHint(parsedCode.raw, resultDescRaw);
 
     const tx = await findTransactionFromWebhook(req, { conversationId, originatorConversationId });
     if (!tx) return callbackAck(res);
+
+    console.info(
+      `[M-Pesa B2C Callback] tx=${tx.transactionId} conversationId=${conversationId || "-"} originatorConversationId=${originatorConversationId || "-"} resultCode=${parsedCode.raw || "-"} resultDesc=${resultDesc || "-"}`
+    );
 
     const eventKey = `b2c_result:${tx.transactionId}:${conversationId || "none"}:${parsedCode.key}`;
     const inserted = await saveEventIfNew({
@@ -202,6 +294,11 @@ router.post("/webhooks/b2c/result", async (req, res) => {
       }
       await tx.save();
     } else {
+      if (normalizeResultCode(parsedCode.raw) === "8006") {
+        console.error(
+          `[M-Pesa B2C Callback] tx=${tx.transactionId} credential_locked action=rotate_or_unlock_security_credential`
+        );
+      }
       if (tx.status !== "failed") {
         assertTransition(tx, "failed", "B2C callback failure", "webhook");
       }
@@ -226,6 +323,10 @@ router.post("/webhooks/b2c/timeout", async (req, res) => {
 
     const tx = await findTransactionFromWebhook(req, { conversationId, originatorConversationId });
     if (!tx) return callbackAck(res);
+
+    console.warn(
+      `[M-Pesa B2C Timeout] tx=${tx.transactionId} conversationId=${conversationId || "-"} originatorConversationId=${originatorConversationId || "-"}`
+    );
 
     const eventKey = `b2c_timeout:${tx.transactionId}:${conversationId || "none"}`;
     const inserted = await saveEventIfNew({
