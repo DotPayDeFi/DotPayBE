@@ -3,6 +3,7 @@ const User = require("../models/User");
 const { connectDB } = require("../config/db");
 const { requireBackendAuth } = require("../middleware/requireBackendAuth");
 const { assertPinFormat, hashPin, verifyPin } = require("../services/security/pin");
+const { grantSignupUsdcBonus } = require("../services/users/signupBonus");
 
 const router = express.Router();
 const USERNAME_REGEX = /^[a-z0-9_]{3,20}$/;
@@ -94,6 +95,13 @@ function toResponse(user) {
     thirdwebCreatedAt: user.thirdwebCreatedAt,
     pinSet: Boolean(user.pinHash),
     pinUpdatedAt: user.pinUpdatedAt,
+    signupBonus: {
+      status: user?.signupBonus?.status ?? null,
+      amountUsd: user?.signupBonus?.amountUsd ?? null,
+      txHash: user?.signupBonus?.txHash ?? null,
+      fundedAt: user?.signupBonus?.fundedAt ?? null,
+      lastError: user?.signupBonus?.lastError ?? null,
+    },
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
   };
@@ -113,7 +121,7 @@ function requireSelfAddress(req, res, normalizedAddress) {
  * Create or update user from DotPay sign-in/sign-up (session user payload).
  * Body: { address, email?, phone?, userId?, authMethod?, createdAt?, username? }
  */
-router.post("/", async (req, res) => {
+router.post("/", requireBackendAuth, async (req, res) => {
   try {
     await connectDB();
 
@@ -128,6 +136,7 @@ router.post("/", async (req, res) => {
         message: "address is required",
       });
     }
+    if (!requireSelfAddress(req, res, normalizedAddress)) return;
 
     if (normalizedUsername && !USERNAME_REGEX.test(normalizedUsername)) {
       return res.status(400).json({
@@ -147,6 +156,17 @@ router.post("/", async (req, res) => {
     }
 
     let user = await User.findOne({ address: normalizedAddress });
+
+    // Smart-account migration path:
+    // if the authenticated address changed (e.g. legacy EOA -> smart account),
+    // carry the existing user record forward by stable thirdweb user id.
+    if (!user && userId) {
+      const legacyUser = await User.findOne({ thirdwebUserId: userId });
+      if (legacyUser && legacyUser.address !== normalizedAddress) {
+        legacyUser.address = normalizedAddress;
+        user = legacyUser;
+      }
+    }
 
     if (!user) {
       const userData = {
@@ -333,7 +353,7 @@ router.post("/:address/pin/verify", requireBackendAuth, async (req, res) => {
  * Set username and ensure DotPay ID exists.
  * Body: { username }
  */
-router.patch("/:address/identity", async (req, res) => {
+router.patch("/:address/identity", requireBackendAuth, async (req, res) => {
   try {
     await connectDB();
 
@@ -343,6 +363,7 @@ router.patch("/:address/identity", async (req, res) => {
     if (!normalizedAddress) {
       return res.status(400).json({ success: false, message: "address is required" });
     }
+    if (!requireSelfAddress(req, res, normalizedAddress)) return;
 
     if (!normalizedUsername || !USERNAME_REGEX.test(normalizedUsername)) {
       return res.status(400).json({
@@ -357,6 +378,7 @@ router.patch("/:address/identity", async (req, res) => {
     }
 
     let user = await User.findOne({ address: normalizedAddress });
+    const hadUsername = Boolean(user?.username);
     if (!user) {
       user = new User({
         address: normalizedAddress,
@@ -370,9 +392,25 @@ router.patch("/:address/identity", async (req, res) => {
 
     await user.save();
 
+    let signupBonus = null;
+    const onboardingCompleted = !hadUsername && Boolean(user.pinHash);
+    if (onboardingCompleted) {
+      signupBonus = await grantSignupUsdcBonus(user, { source: "identity_setup" });
+      if (signupBonus?.granted) {
+        console.log(
+          `Signup bonus funded for ${user.address}: ${signupBonus.amountUsd} USDC (tx: ${signupBonus.txHash})`
+        );
+      } else if (signupBonus?.reason === "failed") {
+        console.warn(`Signup bonus transfer failed for ${user.address}: ${signupBonus?.message || "unknown error"}`);
+      } else if (signupBonus?.reason && signupBonus?.reason !== "disabled") {
+        console.warn(`Signup bonus skipped for ${user.address}: ${signupBonus.reason}`);
+      }
+    }
+
     return res.status(200).json({
       success: true,
       data: toResponse(user),
+      meta: signupBonus ? { signupBonus } : undefined,
     });
   } catch (err) {
     console.error("PATCH /api/users/:address/identity error:", err);

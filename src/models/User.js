@@ -47,6 +47,27 @@ const userSchema = new mongoose.Schema(
      */
     pinHash: { type: String, default: null, trim: true },
     pinUpdatedAt: { type: Date, default: null },
+
+    /**
+     * One-time signup USDC grant status for test onboarding.
+     * This prevents duplicate grants when sync endpoints are called repeatedly.
+     */
+    signupBonus: {
+      status: {
+        type: String,
+        enum: ["pending", "funded", "failed", null],
+        default: null,
+      },
+      amountUsd: { type: Number, default: null },
+      amountUnits: { type: String, default: null, trim: true },
+      tokenAddress: { type: String, default: null, trim: true, lowercase: true },
+      chainId: { type: Number, default: null },
+      txHash: { type: String, default: null, trim: true, lowercase: true },
+      fundedAt: { type: Date, default: null },
+      lastAttemptAt: { type: Date, default: null },
+      attempts: { type: Number, default: 0 },
+      lastError: { type: String, default: null },
+    },
   },
   {
     timestamps: true,

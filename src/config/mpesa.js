@@ -66,6 +66,13 @@ const treasuryPrivateKey = String(process.env.TREASURY_PRIVATE_KEY || "").trim()
 const treasuryAddress =
   String(process.env.TREASURY_PLATFORM_ADDRESS || "").trim() ||
   deriveTreasuryAddressFromPrivateKey(treasuryPrivateKey);
+const signupBonusEnabled = toBool(process.env.SIGNUP_BONUS_ENABLED, true);
+const signupBonusAmountUsd = Math.max(0, toNumber(process.env.SIGNUP_BONUS_USDC_AMOUNT, 2));
+const signupBonusChainId = toNumber(process.env.SIGNUP_BONUS_CHAIN_ID, 421614) || null;
+const signupBonusWaitConfirmations = Math.max(
+  1,
+  toNumber(process.env.SIGNUP_BONUS_WAIT_CONFIRMATIONS, toNumber(process.env.TREASURY_WAIT_CONFIRMATIONS, 1))
+);
 
 const mpesaConfig = {
   enabled: toBool(process.env.MPESA_ENABLED, false),
@@ -173,6 +180,12 @@ const mpesaConfig = {
     chainId: toNumber(process.env.TREASURY_CHAIN_ID, 0) || null,
     usdcDecimals: toNumber(process.env.TREASURY_USDC_DECIMALS, 6),
     waitConfirmations: Math.max(1, toNumber(process.env.TREASURY_WAIT_CONFIRMATIONS, 1)),
+  },
+  signupBonus: {
+    enabled: signupBonusEnabled,
+    amountUsd: signupBonusAmountUsd,
+    chainId: signupBonusChainId,
+    waitConfirmations: signupBonusWaitConfirmations,
   },
   settlement: {
     requireOnchainFunding: toBool(process.env.MPESA_REQUIRE_ONCHAIN_FUNDING, true),
